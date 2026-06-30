@@ -5,6 +5,15 @@ GTM signal pipeline. Classifies role + JD against the trigger framework, scores
 each posting (provisional floor; company-fit + convergence added at enrichment),
 dedupes via a seen-cache, and writes the same JSON shape as the Galxe/Zealy
 collectors. Python 3.9 compatible.
+
+When R2 credentials are present in the environment, the output file is uploaded
+to Cloudflare R2 (so the snag-scoring job can read it). On a machine without
+those variables (e.g. a manual Mac run) the R2 step is a silent no-op and
+behavior is unchanged.
+
+Environment:
+    WEB3CAREER_TOKEN - web3.career API token (required)
+    R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET - optional (enables R2 upload)
 """
 
 import argparse, html, json, os, re, sys, time
@@ -93,6 +102,43 @@ TITLE_POINTS = {1: 3, 2: 2, 3: 1}
 PER_TAG_LIMIT = 100
 MAX_RETRIES = 3
 
+
+# --- Cloudflare R2 upload (S3-compatible) ---------------------------------
+def _r2_client():
+    """Return (client, bucket) for Cloudflare R2, or (None, None) if not configured.
+    Mirrors the helper in frontrun_signals.py so behavior matches exactly. Every
+    R2 step becomes a silent no-op when unconfigured, so a manual Mac run is
+    unaffected."""
+    endpoint   = os.environ.get("R2_ENDPOINT")
+    access_key = os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
+    bucket     = os.environ.get("R2_BUCKET")
+    if not all([endpoint, access_key, secret_key, bucket]):
+        return None, None
+    try:
+        import boto3
+    except ImportError:
+        print("  [warn] R2 vars set but boto3 not installed. Run: pip3 install boto3", file=sys.stderr)
+        return None, None
+    client = boto3.client(
+        "s3", endpoint_url=endpoint,
+        aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+        region_name="auto",
+    )
+    return client, bucket
+
+
+def upload_to_r2(local_path: str) -> None:
+    """Upload the output JSON to R2 (no-op if R2 isn't configured)."""
+    client, bucket = _r2_client()
+    if client is None:
+        print("  R2 not configured - skipping upload (local file written only).")
+        return
+    key = os.path.basename(local_path)
+    client.upload_file(local_path, bucket, key)
+    print("  Uploaded to R2: %s/%s" % (bucket, key))
+
+
 # --- HTTP -----------------------------------------------------------------
 def fetch_jobs_for_tag(token: str, tag: str) -> List[dict]:
     params = {"token": token, "tag": tag, "limit": PER_TAG_LIMIT, "show_description": "true"}
@@ -159,29 +205,8 @@ def band(score: int) -> str:
         return "B"
     return "C"
 
-# --- Seen cache (Redis on Render via REDIS_URL, else local file) ----------
-SEEN_KEY = "web3career:seen_ids"
-
-def _redis_client():
-    url = os.environ.get("REDIS_URL")
-    if not url:
-        return None
-    try:
-        import redis  # lazy import; only needed when REDIS_URL is set
-    except ImportError:
-        print("  [warn] REDIS_URL set but 'redis' package missing; falling back to file", file=sys.stderr)
-        return None
-    return redis.from_url(url)
-
+# --- Seen cache -----------------------------------------------------------
 def load_seen(path: str) -> set:
-    r = _redis_client()
-    if r is not None:
-        try:
-            raw = r.get(SEEN_KEY)
-            return set(json.loads(raw)) if raw else set()
-        except Exception as e:
-            print("  [warn] redis load failed (%s); starting empty" % e, file=sys.stderr)
-            return set()
     if os.path.exists(path):
         try:
             with open(path) as f:
@@ -191,13 +216,6 @@ def load_seen(path: str) -> set:
     return set()
 
 def save_seen(path: str, seen: set) -> None:
-    r = _redis_client()
-    if r is not None:
-        try:
-            r.set(SEEN_KEY, json.dumps(sorted(seen)))
-            return
-        except Exception as e:
-            print("  [warn] redis save failed (%s); writing file instead" % e, file=sys.stderr)
     with open(path, "w") as f:
         json.dump(sorted(seen), f, indent=2)
 
@@ -217,7 +235,6 @@ def main() -> int:
     seen_path = os.path.join(out_dir, "web3career_seen.json")
     seen = load_seen(seen_path)
 
-    # 1. Fetch + merge across tags
     raw_by_id = {}
     for tag in TAGS:
         for job in fetch_jobs_for_tag(token, tag):
@@ -225,14 +242,13 @@ def main() -> int:
             if jid and jid not in raw_by_id:
                 raw_by_id[jid] = job
 
-    # 2. Classify + filter to fresh, on-target roles; compute observable sub-scores
     partials = []
     new_ids = set()
     seen_role_keys = set()
     for jid, job in raw_by_id.items():
         if jid in seen:
             continue
-        new_ids.add(jid)  # mark seen regardless so noise isn't re-evaluated daily
+        new_ids.add(jid)
         # clean HTML entities in title/company (e.g. "Verification &amp; Activation")
         job["title"] = html.unescape((job.get("title") or "").strip())
         job["company"] = html.unescape((job.get("company") or "").strip())
@@ -246,10 +262,9 @@ def main() -> int:
         core = matches(hay, CORE_KEYWORDS)
         program = matches(hay, PROGRAM_KEYWORDS)
         bvb = matches(hay, BUILD_VS_BUY)
-        # Gate generic titles (Product Manager / Community) on real JD intent
         if needs_jd and not (core or program or bvb):
             continue
-        # Collapse near-duplicate postings: same company + title, different id
+        # collapse near-duplicate postings: same company + title, different id
         role_key = (job["company"].lower(), title.lower())
         if role_key in seen_role_keys:
             continue
@@ -266,7 +281,6 @@ def main() -> int:
         partials.append({"jid": jid, "job": job, "category": category, "tier": tier,
                          "core": core, "program": program, "bvb": bvb, "score": score})
 
-    # 3. Cluster bonus: companies hiring 2+ qualifying roles (+2 each)
     norm = lambda s: (s or "").strip().lower()
     counts = {}
     for p in partials:
@@ -276,17 +290,11 @@ def main() -> int:
         if p["cluster"]:
             p["score"] += 2
 
-    # 4. Build signals
-    signals = []
-    for p in partials:
-        signals.append(build_signal(p))
-
-    # 5. Rank: score desc, then category priority, then tier
+    signals = [build_signal(p) for p in partials]
     signals.sort(key=lambda s: (-s["lead_score"],
                                 CATEGORY_PRIORITY.get(s["job"]["role_category"], 9),
                                 s["job"]["trigger_tier"]))
 
-    # 6. Counts + write
     band_counts, role_counts = {}, {}
     for s in signals:
         band_counts[s["priority_band"]] = band_counts.get(s["priority_band"], 0) + 1
@@ -308,6 +316,9 @@ def main() -> int:
 
     print("Wrote %d job_posting signals to %s" % (len(signals), out_path))
     print("Bands: %s | Roles: %s" % (band_counts if band_counts else "none", role_counts if role_counts else "none"))
+
+    # Mirror the output to R2 so the snag-scoring job can read it (no-op if R2 unset).
+    upload_to_r2(out_path)
     return 0
 
 
@@ -343,16 +354,17 @@ def build_signal(p: dict) -> dict:
         },
         "scoring": {
             "lead_score": score, "score_basis": "provisional floor (role+JD+cluster only)",
-            "pending_enrichment": ["company_type (+3)", "convergence_join (+3)", "drop-list penalties"],
+            "pending_enrichment": ["company_type (+3)", "convergence_join (+3)"],
         },
         "lead_score": score,
         "priority_band": prio,
+        "trigger_reason": reason,
         "likely_buyer_persona": PERSONA.get(category),
         "suggested_snag_motion": MOTION.get(category),
         "engineering_dependency_risk": "high" if p["bvb"] else "low",
         "hubspot_ready": {
             "company_name": company,
-            "website": None,                 # API gives a name only - needs domain resolution
+            "website": None,
             "twitter_handle": None,
             "lead_source": "Web3.career Jobs",
             "signal": "job_posting",
