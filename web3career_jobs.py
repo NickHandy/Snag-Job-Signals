@@ -207,13 +207,16 @@ def band(score: int) -> str:
         return "B"
     return "C"
 
-# --- Seen cache (Redis-backed, with local-file fallback) ------------------
-# The seen-cache must PERSIST across Render's ephemeral runs, or every run
-# re-scrapes all jobs as "new". When REDIS_URL is set (on Render: the snag-seen
-# Valkey instance), seen IDs live in a Redis SET that survives between runs.
-# When REDIS_URL is absent (e.g. a manual Mac run), it falls back to the local
-# JSON file, so local behavior is unchanged.
-SEEN_KEY = "web3career:seen_ids"
+# --- Job lifecycle state (Redis hash, with local-file fallback) -----------
+# We track each matching role's lifecycle so it stays a scoreable signal while
+# the role is OPEN and for a retention window after it's taken down. State per
+# job_id: {first_seen, last_seen, signal}. "Open" = appeared in today's API
+# pull; "taken down" = stopped appearing (last_seen stops advancing). A role is
+# dropped once it hasn't been seen for RETENTION_DAYS. State persists in Redis
+# (the snag-seen Valkey instance) across Render's ephemeral runs; falls back to
+# a local JSON file when REDIS_URL is absent (e.g. a manual Mac run).
+STATE_KEY = "web3career:jobs_state"
+RETENTION_DAYS = 60  # keep scoring a role ~2 months after it's taken down
 
 def _redis_client():
     url = os.environ.get("REDIS_URL")
@@ -232,30 +235,46 @@ def _redis_client():
         print("  [warn] could not connect to Redis (%s) - using local file this run" % e, file=sys.stderr)
         return None
 
-def load_seen(client, local_path: str) -> set:
+def load_state(client, local_path: str) -> dict:
+    """Return {job_id: {first_seen, last_seen, signal}}."""
     if client is not None:
         try:
-            return set(client.smembers(SEEN_KEY))
+            raw = client.hgetall(STATE_KEY)
+            return {k: json.loads(v) for k, v in raw.items()}
         except Exception as e:
             print("  [warn] Redis read failed (%s) - using local file this run" % e, file=sys.stderr)
     if os.path.exists(local_path):
         try:
             with open(local_path) as f:
-                return set(json.load(f))
+                return json.load(f)
         except (ValueError, IOError):
-            return set()
-    return set()
+            return {}
+    return {}
 
-def save_seen(client, local_path: str, seen: set, new_ids: set) -> None:
+def save_state(client, local_path: str, state: dict) -> None:
+    """Persist state, mirroring deletions (expiry) so the store matches exactly."""
     if client is not None:
         try:
-            if new_ids:
-                client.sadd(SEEN_KEY, *new_ids)
+            existing = set(client.hkeys(STATE_KEY))
+            to_del = existing - set(state.keys())
+            pipe = client.pipeline()
+            if to_del:
+                pipe.hdel(STATE_KEY, *to_del)
+            for jid, entry in state.items():
+                pipe.hset(STATE_KEY, jid, json.dumps(entry))
+            pipe.execute()
             return
         except Exception as e:
             print("  [warn] Redis write failed (%s) - writing local file instead" % e, file=sys.stderr)
     with open(local_path, "w") as f:
-        json.dump(sorted(seen | new_ids), f, indent=2)
+        json.dump(state, f, indent=2)
+
+def _days_since(date_str: Optional[str], today) -> int:
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        return (today - d).days
+    except (ValueError, TypeError):
+        return 0
 
 # --- Main -----------------------------------------------------------------
 def main() -> int:
@@ -270,12 +289,13 @@ def main() -> int:
         return 1
 
     out_dir = args.output_dir
-    seen_path = os.path.join(out_dir, "web3career_seen.json")
+    state_path = os.path.join(out_dir, "web3career_jobs_state.json")
     rclient = _redis_client()
-    seen = load_seen(rclient, seen_path)
-    print("Seen-cache: %s (%d ids loaded)"
-          % ("Redis" if rclient is not None else "local file", len(seen)))
+    state = load_state(rclient, state_path)
+    print("Job state: %s (%d tracked roles loaded)"
+          % ("Redis" if rclient is not None else "local file", len(state)))
 
+    # 1. Fetch the FULL current matching population (not a delta).
     raw_by_id = {}
     for tag in TAGS:
         for job in fetch_jobs_for_tag(token, tag):
@@ -283,13 +303,10 @@ def main() -> int:
             if jid and jid not in raw_by_id:
                 raw_by_id[jid] = job
 
+    # 2. Classify + score every matching role (no seen-skip; we want the population).
     partials = []
-    new_ids = set()
     seen_role_keys = set()
     for jid, job in raw_by_id.items():
-        if jid in seen:
-            continue
-        new_ids.add(jid)
         # clean HTML entities in title/company (e.g. "Verification &amp; Activation")
         job["title"] = html.unescape((job.get("title") or "").strip())
         job["company"] = html.unescape((job.get("company") or "").strip())
@@ -331,34 +348,85 @@ def main() -> int:
         if p["cluster"]:
             p["score"] += 2
 
-    signals = [build_signal(p) for p in partials]
+    today = datetime.now(timezone.utc).date()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # 3. Upsert today's open roles into the lifecycle state.
+    open_ids = set()
+    new_count = 0
+    for p in partials:
+        jid = p["jid"]
+        sig = build_signal(p)
+        open_ids.add(jid)
+        if jid in state:
+            state[jid]["last_seen"] = today_str
+            state[jid]["signal"] = sig          # refresh in case details changed
+        else:
+            state[jid] = {"first_seen": today_str, "last_seen": today_str, "signal": sig}
+            new_count += 1
+
+    # 4. Expire roles unseen for longer than the retention window.
+    expired = [jid for jid, e in state.items()
+               if _days_since(e.get("last_seen", today_str), today) > RETENTION_DAYS]
+    for jid in expired:
+        del state[jid]
+
+    # 5. Emit the FULL retained population (open + taken-down-but-within-retention).
+    signals = []
+    for jid, e in state.items():
+        sig = dict(e["signal"])
+        is_open = jid in open_ids
+        job_blk = dict(sig.get("job") or {})
+        # recency anchor: real posted_at if the API gave one, else first_seen.
+        if not job_blk.get("posted_at"):
+            job_blk["posted_at"] = e.get("first_seen")
+        job_blk["first_seen"] = e.get("first_seen")
+        job_blk["last_seen"] = e.get("last_seen")
+        job_blk["is_open"] = is_open
+        job_blk["days_since_last_seen"] = _days_since(e.get("last_seen", today_str), today)
+        sig["job"] = job_blk
+        sig["is_open"] = is_open
+        sig["is_new"] = (e.get("first_seen") == today_str)
+        signals.append(sig)
+
     signals.sort(key=lambda s: (-s["lead_score"],
                                 CATEGORY_PRIORITY.get(s["job"]["role_category"], 9),
                                 s["job"]["trigger_tier"]))
 
     band_counts, role_counts = {}, {}
+    open_n = 0
     for s in signals:
         band_counts[s["priority_band"]] = band_counts.get(s["priority_band"], 0) + 1
         rc = s["job"]["role_category"]; role_counts[rc] = role_counts.get(rc, 0) + 1
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if s["is_open"]:
+            open_n += 1
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "lookback_hours": args.hours,
         "total_signals": len(signals),
+        "open_roles": open_n,
+        "new_today": new_count,
+        "expired_dropped": len(expired),
+        "retention_days": RETENTION_DAYS,
         "signal_counts": {"job_posting": len(signals)},
         "band_counts": band_counts,
         "role_counts": role_counts,
         "signals": signals,
     }
-    out_path = os.path.join(out_dir, "web3career_jobs_%s.json" % today)
+    # Stable snapshot filename (not date-stamped): it always holds the CURRENT
+    # retained population, so the scorer reads one current file and same-day
+    # re-runs can't clobber it with a smaller delta.
+    out_path = os.path.join(out_dir, "web3career_jobs_latest.json")
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
-    save_seen(rclient, seen_path, seen, new_ids)
+    save_state(rclient, state_path, state)
 
-    print("Wrote %d job_posting signals to %s" % (len(signals), out_path))
+    print("Tracked roles: %d (%d open, %d new today, %d expired/dropped)"
+          % (len(signals), open_n, new_count, len(expired)))
     print("Bands: %s | Roles: %s" % (band_counts if band_counts else "none", role_counts if role_counts else "none"))
 
-    # Mirror the output to R2 so the snag-scoring job can read it (no-op if R2 unset).
+    # Mirror the snapshot to R2 so the snag-scoring job can read it (no-op if R2 unset).
     upload_to_r2(out_path)
     return 0
 
