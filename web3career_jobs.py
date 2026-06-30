@@ -13,6 +13,8 @@ behavior is unchanged.
 
 Environment:
     WEB3CAREER_TOKEN - web3.career API token (required)
+    REDIS_URL - Redis/Valkey connection string for the persistent seen-cache
+                (optional; falls back to a local file if absent, e.g. a Mac run)
     R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET - optional (enables R2 upload)
 """
 
@@ -205,19 +207,55 @@ def band(score: int) -> str:
         return "B"
     return "C"
 
-# --- Seen cache -----------------------------------------------------------
-def load_seen(path: str) -> set:
-    if os.path.exists(path):
+# --- Seen cache (Redis-backed, with local-file fallback) ------------------
+# The seen-cache must PERSIST across Render's ephemeral runs, or every run
+# re-scrapes all jobs as "new". When REDIS_URL is set (on Render: the snag-seen
+# Valkey instance), seen IDs live in a Redis SET that survives between runs.
+# When REDIS_URL is absent (e.g. a manual Mac run), it falls back to the local
+# JSON file, so local behavior is unchanged.
+SEEN_KEY = "web3career:seen_ids"
+
+def _redis_client():
+    url = os.environ.get("REDIS_URL")
+    if not url:
+        return None
+    try:
+        import redis
+    except ImportError:
+        print("  [warn] REDIS_URL set but redis not installed. Run: pip3 install redis", file=sys.stderr)
+        return None
+    try:
+        client = redis.from_url(url, decode_responses=True)
+        client.ping()
+        return client
+    except Exception as e:
+        print("  [warn] could not connect to Redis (%s) - using local file this run" % e, file=sys.stderr)
+        return None
+
+def load_seen(client, local_path: str) -> set:
+    if client is not None:
         try:
-            with open(path) as f:
+            return set(client.smembers(SEEN_KEY))
+        except Exception as e:
+            print("  [warn] Redis read failed (%s) - using local file this run" % e, file=sys.stderr)
+    if os.path.exists(local_path):
+        try:
+            with open(local_path) as f:
                 return set(json.load(f))
         except (ValueError, IOError):
             return set()
     return set()
 
-def save_seen(path: str, seen: set) -> None:
-    with open(path, "w") as f:
-        json.dump(sorted(seen), f, indent=2)
+def save_seen(client, local_path: str, seen: set, new_ids: set) -> None:
+    if client is not None:
+        try:
+            if new_ids:
+                client.sadd(SEEN_KEY, *new_ids)
+            return
+        except Exception as e:
+            print("  [warn] Redis write failed (%s) - writing local file instead" % e, file=sys.stderr)
+    with open(local_path, "w") as f:
+        json.dump(sorted(seen | new_ids), f, indent=2)
 
 # --- Main -----------------------------------------------------------------
 def main() -> int:
@@ -233,7 +271,10 @@ def main() -> int:
 
     out_dir = args.output_dir
     seen_path = os.path.join(out_dir, "web3career_seen.json")
-    seen = load_seen(seen_path)
+    rclient = _redis_client()
+    seen = load_seen(rclient, seen_path)
+    print("Seen-cache: %s (%d ids loaded)"
+          % ("Redis" if rclient is not None else "local file", len(seen)))
 
     raw_by_id = {}
     for tag in TAGS:
@@ -312,7 +353,7 @@ def main() -> int:
     out_path = os.path.join(out_dir, "web3career_jobs_%s.json" % today)
     with open(out_path, "w") as f:
         json.dump(payload, f, indent=2)
-    save_seen(seen_path, seen | new_ids)
+    save_seen(rclient, seen_path, seen, new_ids)
 
     print("Wrote %d job_posting signals to %s" % (len(signals), out_path))
     print("Bands: %s | Roles: %s" % (band_counts if band_counts else "none", role_counts if role_counts else "none"))
