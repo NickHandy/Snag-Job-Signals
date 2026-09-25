@@ -269,6 +269,20 @@ def save_state(client, local_path: str, state: dict) -> None:
     with open(local_path, "w") as f:
         json.dump(state, f, indent=2)
 
+def _job_date(job: dict) -> Optional[str]:
+    """Best-effort posting date (YYYY-MM-DD) from whatever field the API sends."""
+    for k in ("date_epoch", "postedAt", "date", "posted_at", "created_at"):
+        v = job.get(k)
+        if v in (None, ""):
+            continue
+        try:
+            if isinstance(v, (int, float)) or str(v).isdigit():
+                return datetime.fromtimestamp(int(v), timezone.utc).strftime("%Y-%m-%d")
+            return str(v)[:10]
+        except (ValueError, OSError, OverflowError):
+            continue
+    return None
+
 def _days_since(date_str: Optional[str], today) -> int:
     try:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -298,10 +312,21 @@ def main() -> int:
     # 1. Fetch the FULL current matching population (not a delta).
     raw_by_id = {}
     for tag in TAGS:
-        for job in fetch_jobs_for_tag(token, tag):
+        tag_jobs = fetch_jobs_for_tag(token, tag)
+        tag_new = 0
+        for job in tag_jobs:
             jid = str(job.get("id") or job.get("url") or "")
+            if jid and jid not in state:
+                tag_new += 1
             if jid and jid not in raw_by_id:
                 raw_by_id[jid] = job
+        dates = sorted(_job_date(j) for j in tag_jobs if _job_date(j))
+        print("  [diag] tag=%-20s fetched=%3d  unseen_ids=%3d  newest=%s  oldest=%s"
+              % (tag, len(tag_jobs), tag_new, dates[-1] if dates else "?", dates[0] if dates else "?"))
+    print("  [diag] unique postings fetched: %d" % len(raw_by_id))
+    if raw_by_id:
+        sample = next(iter(raw_by_id.values()))
+        print("  [diag] job fields: %s" % ", ".join(sorted(sample.keys())))
 
     # 2. Classify + score every matching role (no seen-skip; we want the population).
     partials = []
@@ -424,6 +449,14 @@ def main() -> int:
 
     print("Tracked roles: %d (%d open, %d new today, %d expired/dropped)"
           % (len(signals), open_n, new_count, len(expired)))
+    print("  [diag] classified+kept today: %d of %d fetched" % (len(partials), len(raw_by_id)))
+    fs = {}
+    for e in state.values():
+        d = e.get("first_seen") or "?"
+        fs[d] = fs.get(d, 0) + 1
+    recent = sorted(fs.items())[-21:]
+    print("  [diag] roles by first_seen (last 21 dates): %s"
+          % ", ".join("%s:%d" % kv for kv in recent))
     print("Bands: %s | Roles: %s" % (band_counts if band_counts else "none", role_counts if role_counts else "none"))
 
     # Mirror the snapshot to R2 so the snag-scoring job can read it (no-op if R2 unset).
